@@ -7,3 +7,6 @@ Revision history for Perl extension Mail::IMAPTalk.
 	- add utf-8 decoding support
   - add annotatemore support
 
+1.02  Tue Sep  2 10:48 2004
+	- fix literal continuation response check
+

@@ -113,7 +113,7 @@ sub import {
   goto &Exporter::import;
 }
 
-our $VERSION = '1.01';
+our $VERSION = '1.02';
 # }}}
 
 # Use modules {{{
@@ -2412,7 +2412,7 @@ sub _send_cmd {
 
       # Wait for "+ go ahead" response
       my $GoAhead = $Self->_imap_socket_read_line();
-      if ($GoAhead eq "+ go ahead") {
+      if ($GoAhead =~ /^\+/) {
         if (ref($Arg) eq "ARRAY") {
           $Self->_imap_socket_out($Arg->[1]);
         } else {
@@ -2421,7 +2421,7 @@ sub _send_cmd {
 
       # If no "+ go ahead" response, set error state
       } else {
-        die 'Did not get "+ go ahead" response from IMAP server. Got - ' . $GoAhead;
+        die 'Did not get "+ ...go ahead..." response from IMAP server. Got - ' . $GoAhead;
       }
 
     # Otherwise it's just a string, add to line buffer
