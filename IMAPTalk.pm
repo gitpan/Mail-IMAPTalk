@@ -3,7 +3,7 @@ package Mail::IMAPTalk;
 
 =head1 NAME
 
-Mail::IMAPTalk - Perl extension for interacting with IMAP servers
+Mail::IMAPTalk - IMAP client interface with lots of features
 
 =head1 SYNOPSIS
 
@@ -60,6 +60,12 @@ structures into nice PERL data structures
 
 =item *
 
+It correctly supports atoms, quoted strings and literals at any
+point. Some parsers in other modules aren't fully IMAP compatiable
+and may break at odd times with certain messages on some servers
+
+=item *
+
 It allows large return values (eg. attachments on a message)
 to be read directly into a file, rather than into memory.
 
@@ -69,6 +75,11 @@ It includes some helper functions to find the actual text/plain
 or text/html part of a message out of a complex MIME structure.
 It also can find a list of attachements, and CID links for HTML
 messages with attached images
+
+=item *
+
+It supports decoding of MIME headers to perl utf-8 strings automatically,
+so you don't have to deal with MIME encoded headers (enabled optionally)
 
 =back
 
@@ -88,7 +99,21 @@ require Exporter;
 );
 Exporter::export_ok_tags('Default');
 
-our $VERSION = '1.00';
+sub import {
+  # Test for special case if need UTF8 support
+  our $AlreadyLoadedEncode;
+  if (@_>1 && $_[1] && $_[1] eq ':utf8support') {
+    splice @_, 1, 1;
+    if (!$AlreadyLoadedEncode) {
+      eval "use Encode qw(decode);";
+      $AlreadyLoadedEncode = 1;
+    }
+  }
+
+  goto &Exporter::import;
+}
+
+our $VERSION = '1.01';
 # }}}
 
 # Use modules {{{
@@ -279,6 +304,11 @@ use constant Selected => 3;
 
 # What a link break is on the network connection
 use constant LB => "\015\012";
+
+# Regexps used to determine if header is MIME encoded
+my $RFC1522Token = qr/[^\x00-\x1f\(\)\<\>\@\,\;\:\"\/\[\]\?\.\=\ ]+/;
+my $NeedDecodeUTF8Regexp = qr/=\?$RFC1522Token\?$RFC1522Token\?[^\?]*\?=/;
+
 # }}}
 
 =head1 CONSTRUCTOR
@@ -483,7 +513,7 @@ sub new {
 
   # Set uid mode
   $Self->uid($Args{Uid});
-  $Self->parse_mode(1);
+  $Self->parse_mode(Envelope => 1, BodyStructure => 1);
 
   # Login first if specified
   if ($Args{Username}) {
@@ -551,7 +581,7 @@ one of the constants (Unconnected, Connected, Authenticated, Selected)
 sub state {
   my $Self = shift;
   $Self->{State} = $_[0] if defined $_[0];
-  return $Self->{State} || '';
+  return (defined($Self->{State}) ? $Self->{State} : '');
 }
 
 =item I<uid(optional $UidMode)>
@@ -897,16 +927,47 @@ sub clear_response_code {
   return 1;
 }
 
-=item I<parse_mode($ParseMode)>
+=item I<parse_mode(ParseOption => $ParseMode)>
 
-Changes how results of fetch commands are parsed. Setting this to true
-enables more perl friends structures to be returned for envelope
-and bodystruct fetch results. See the B<FETCH RESULTS> section.
+Changes how results of fetch commands are parsed. Available
+options are:
+
+=over 4
+
+=item I<BodyStructure>
+
+Parse bodystructure into more perl friendly structure
+See the B<FETCH RESULTS> section.
+
+=item I<Envelope>
+
+Parse envelopes into more perl friendly structure
+See the B<FETCH RESULTS> section.
+
+=item I<EnvelopeRaw>
+
+If parsing envelopes, create To/Cc/Bcc and
+Raw-To/Raw-Cc/Raw-Bcc entries which are array refs of 4
+entries each as returned by the IMAP server
+
+=item I<DecodeUTF8>
+
+If parsing envelopes, decode any MIME encoded headers into
+perl UTF-8 strings
+
+For this to work, you must have 'used' Mail::IMAPTalk with:
+
+use Mail::IMAPTalk qw(:utf8support ...)
+
+=back
 
 =cut
 sub parse_mode {
   my $Self = shift;
-  $Self->{ParseMode} = shift;
+
+  my $ParseMode = $Self->{ParseMode} || {};
+  $Self->{ParseMode} = { %$ParseMode, @_ };
+
 }
 
 =item I<set_tracing($Tracer)>
@@ -1010,6 +1071,7 @@ sub select {
     return $Self->{CurrentFolderMode};
   } else {
     $Self->{CurrentFolder} = "";
+    $Self->{LastError} = $@ = "Select failed for folder '$Folder' : $Self->{LastError}";
   }
   
   return undef;
@@ -1394,6 +1456,55 @@ sub multistatus {
   return \%Resp;
 }
 
+=item I<getannotation($FolderName, $Entry, $Attribute)>
+
+Perform the IMAP 'getannotation' command to get the annotation(s)
+for a mailbox.  See imap-annotatemore extension for details
+
+Examples:
+  my $Result = $IMAP->getannotation('user.joe.blah', '/*' '*') || die "IMAP error: $@";
+  $Result = {
+    'user.joe.blah' => {
+      '/vendor/cmu/cyrus-imapd/size' => {
+        'size.shared' => '5',
+        'content-type.shared' => 'text/plain',
+        'value.shared' => '19261'
+      },
+      '/vendor/cmu/cyrus-imapd/lastupdate' => {
+        'size.shared' => '26',
+        'content-type.shared' => 'text/plain',
+        'value.shared' => '26-Mar-2004 13:31:56 -0800'
+      },
+      '/vendor/cmu/cyrus-imapd/partition' => {
+        'size.shared' => '7',
+        'content-type.shared' => 'text/plain',
+        'value.shared' => 'default'
+      }
+    }
+  };
+
+=cut
+sub getannotation {
+  my $Self = shift;
+  $Self->_require_capability('annotatemore') || return undef;
+  return $Self->_imap_cmd("getannotation", 0, "", $Self->_fix_folder_name(+shift, 1), _quote_list(@_));
+}
+
+=item I<setannotation($FolderName, $Entry, $Attribute, [ $Entry, $Attribute ], ... )>
+
+Perform the IMAP 'setannotation' command to get the annotation(s)
+for a mailbox.  See imap-annotatemore extension for details
+
+Examples:
+  my $Result = $IMAP->setannotation('user.joe.blah', '/comment', [ 'value.priv' 'A comment' ])
+    || die "IMAP error: $@";
+
+=cut
+sub setannotation {
+  my $Self = shift;
+  $Self->_require_capability('annotatemore') || return undef;
+  return $Self->_imap_cmd("setannotation", 0, "", $Self->_fix_folder_name(+shift, 1), _quote_list(@_));
+}
 
 =item I<close()>
 
@@ -1662,6 +1773,35 @@ sub thread {
   return (+shift)->_imap_cmd("thread", 1, "thread", @_);
 }
 
+=item I<fetch_flags($MessageIds)>
+
+Perform an IMAP 'fetch flags' command to retrieve the specified flags
+for the specified messages.
+
+This is just a special fast path version of fetch
+
+=cut
+sub fetch_flags {
+  my $Self = shift;
+
+  my $Cmd = $Self->{Uid} ? 'uid fetch' : 'fetch';
+  $Self->_send_cmd($Cmd, _fix_message_ids(+shift), '(flags)');
+
+  my ($Tag, $MsgId, %FetchRes);
+
+  $_ = $Self->_imap_socket_read_line();
+  ($Tag, $MsgId, $_) = (/^(\S+) (\S+) \S+(?: \((.*)\))?/);
+  while ($Tag ne $Self->{CmdId}) {
+    my ($Uid) = /UID (\d+)/i;
+    my ($Flags) = /FLAGS \((.*)\)/i;
+    $FetchRes{$Uid} = { uid => $Uid, flags => [ split ' ', $Flags ] };
+    $_ = $Self->_imap_socket_read_line();
+    ($Tag, $MsgId, $_) = (/^(\S+) (\S+) \S+(?: \((.*)\))?/);
+  }
+
+  return \%FetchRes;
+}
+
 =back
 =cut
 
@@ -1747,19 +1887,26 @@ sub find_message {
   my @ComponentList = @_;
   my (%MsgComponents, $Found);
 
+  my @TextParts = qw(plain text enriched calendar);
+
   # Repeat until we find something
   while (@ComponentList) {
     my $CurrentComponent = shift @ComponentList;
 
-    # Yay, found text component (that's not an attachment)
+    # Yay, found text component
     my $CD = $CurrentComponent->{'Content-Disposition'};
-    if ($CurrentComponent->{'MIME-Type'} eq 'text' &&
-        (!$CD || (ref($CD) && !$CD->{attachment}))) {
+    if ($CurrentComponent->{'MIME-Type'} eq 'text') {
+
+      # Skip it attachment or inline which has a filename
+      next if ref($CD) && $CD->{attachment};
+      next if ref($CD) && $CD->{inline}->{filename};
 
       # Get sub-type and set it if not already found
       my $SubType = $CurrentComponent->{'MIME-Subtype'};
-      $MsgComponents{$SubType} = $CurrentComponent
-        if !exists $MsgComponents{$SubType};
+      if (grep { $SubType eq $_ } @TextParts, 'html') {
+        $MsgComponents{$SubType} = $CurrentComponent
+          if !exists $MsgComponents{$SubType};
+      }
     }
 
     # If it's a multi-part, what type
@@ -1775,7 +1922,22 @@ sub find_message {
       # Otherwise look at first part of multipart type
       } else {
         push @ComponentList, $MultiComponents[0];
+        # Or second part if it's definitely a text part
+        #  (some mailers put attachments first...)
+        if (@MultiComponents > 1 && $MultiComponents[1]->{'MIME-Type'} eq 'text') {
+          push @ComponentList, $MultiComponents[1];
+        }
+
       }
+    }
+  }
+
+  # we don't want to return multiple text parts!
+  my @TextParts1 = @TextParts;
+  while (my $SubType = shift @TextParts1) {
+    if (exists $MsgComponents{$SubType}) {
+      for (@TextParts1) { delete $MsgComponents{$_}; }
+      last;
     }
   }
 
@@ -2146,8 +2308,7 @@ sub _imap_cmd {
   $Self->{LastError} = undef;
 
   # Prefix command with uid if uid command and in uid mode
-  $Cmd = 'uid ' . $Cmd
-    if ($Self->{Uid} && $IsUidCmd ? "uid " : "");
+  $Cmd = 'uid ' . $Cmd if $IsUidCmd && $Self->{Uid};
 
   # Send command and parse response. Put in an eval because we 'die' if any problems
   my ($CompletionResp, $DataResp);
@@ -2315,7 +2476,7 @@ sub _parse_response {
     if ($Res1 =~ /^(\d+)$/) {
 
       my $Res2 = lc($Self->_next_atom());
-      if ($Res2 eq 'exists' || $Res2 eq 'recent') {
+      if ($Res2 eq 'exists' || $Res2 eq 'recent' || $Res2 eq 'expunge') {
         $Self->{Cache}->{$Res2} = $Res1;
       } elsif ($Res2 eq 'fetch') {
         # Handle fetch response
@@ -2325,7 +2486,7 @@ sub _parse_response {
         # Store the result in our response hash
         $DataResp = {} if ref($DataResp) ne 'HASH';
         $DataResp->{$Res1} = $Fetch;
-      } else {
+      } elsif (!$DataResp) {
         # Don't know other response types, just return the atom
         $DataResp = $Self->_next_atom();
       }
@@ -2398,6 +2559,13 @@ sub _parse_response {
     } elsif ($Res1 eq 'acl') {
       $DataResp = $Self->_remaining_atoms();
       shift @$DataResp;
+
+    } elsif ($Res1 eq 'annotation') {
+      my ($Name, $Entry, $Attributes) = @{$Self->_remaining_atoms()};
+      my $RFM = $Self->{RootFolderMatch2};
+      $Name =~ s/^$RFM// if $RFM;
+      $DataResp = {} if ref($DataResp) ne 'HASH';
+      $DataResp->{$Name}->{$Entry} = { @{$Attributes || []} };
 
     } elsif (($Res1 eq 'bye') && ($Self->{LastCmd} ne 'logout')) {
       die "Connection was unexpectedly closed by host";
@@ -2571,7 +2739,9 @@ sub _next_atom {
       if ($CurAtom = $Self->{LiteralControl}) {
         $Self->_copy_imap_socket_to_handle($CurAtom, $1);
       } else {
-        $CurAtom = $Self->_imap_socket_read_bytes($1);
+        # Capture with regexp to untaint
+        my $Bytes = $Self->_imap_socket_read_bytes($1);
+        ($CurAtom) = ($Bytes =~ /^(.*)$/s);
       }
       # Read new line and strip first space if any
       $Line = $Self->_imap_socket_read_line();
@@ -2622,9 +2792,10 @@ sub _remaining_atoms() {
   #  Use a quick loop to pull these out one at a time and cast to int() which
   #  reduces memory usage, and is faster than general _next_atom() calls
   if ($SlurpIDs) {
-    my $Line = $Self->{ReadLine};
-    while ($Line =~ /\G(\d+) ?/gc) {
-      push @AtomList, int($1);
+    for ($Self->{ReadLine}) {
+      while (/\G(\d+) ?/gc) {
+        push @AtomList, int($1);
+      }
     }
     $Self->{ReadLine} = '';
     return \@AtomList;
@@ -2884,6 +3055,30 @@ sub _quote {
   return '"' . $Str . '"';
 }
 
+=item I<_quote_list(@Items)>
+
+For each item in @Items:
+1. If it's a string, quote as "..."
+2. If it's an array ref, place in (...) and quote each item
+
+Returns a list as long as @Items
+
+=cut
+sub _quote_list {
+  my @Items = @_;
+  for (@Items) {
+    if (ref $_) {
+      $_ = '(' . join(' ', map { $_->[1] } _quote_list(@$_)) . ')';
+    } else {
+      # Replace " and \ with \" and \\ and surround with "..."
+      s/(["\\])/\\$1/g;
+      $_ = [ 'NoQuote', '"' . $_ . '"' ];
+    }
+  }
+
+  return @Items;
+}
+
 =back
 =cut
 
@@ -2898,10 +3093,11 @@ Parses an array reference list of ($Key, $Value) pairs into a hash.
 Makes sure that all the keys are lower cased (lc) first.
 
 =cut
-sub _parse_list_to_hash
-{
+sub _parse_list_to_hash {
   my $ContentHashList = shift || [];
   my $Recursive = shift;
+
+  ref($ContentHashList) eq 'ARRAY' || return { };
 
   my %Res;
   while (@$ContentHashList) {
@@ -2916,14 +3112,20 @@ sub _parse_list_to_hash
   return \%Res;
 }
 
-=item I<_fix_folder_name($FolderName)>
+=item I<_fix_folder_name($FolderName, $WildCard)>
 
 Changes a folder name based on the current root folder prefix as set
 with the C<set_root_prefix()> call.
 
+If $WildCard is true, then a folder name with % or *
+is left alone
+
 =cut
 sub _fix_folder_name {
-  my ($Self, $FolderName) = @_;
+  my ($Self, $FolderName, $WildCard) = @_;
+
+  return $FolderName if $WildCard && $FolderName =~ /[\*\%]/;
+
   my $RootFolderMatch = $Self->{RootFolderMatch};
 
   # If no root folder, just return passed in folder
@@ -2992,9 +3194,9 @@ This is used to parse an envelope structure returned from a fetch call.
 See the documentation section 'FETCH RESULTS' for more information.
 
 =cut
-sub _parse_email_address
-{
+sub _parse_email_address {
   my $EmailAddressList = shift || [];
+  my $DecodeUTF8 = shift;
 
   # Email addresses always come as a list of addresses
   my @EmailAdrs;
@@ -3008,6 +3210,7 @@ sub _parse_email_address
     my $EmailStr = ($Adr->[2] || '') . '@' . ($Adr->[3] || '');
     # If the email address has a name, add it at the start and put <> around address
     if ($Adr->[0]) {
+      _decode_utf8($Adr->[0]) if $DecodeUTF8 && $Adr->[0] =~ $NeedDecodeUTF8Regexp;
       # Strip any existing \"'s
       $Adr->[0] =~ s/\"//g;
       $EmailStr = '"' . $Adr->[0] . '" <' . $EmailStr . '>';
@@ -3020,38 +3223,48 @@ sub _parse_email_address
   return join(", ", @EmailAdrs);
 }
 
-=item I<_parse_envelope($Envelope)>
+=item I<_parse_envelope($Envelope, $IncludeRaw, $DecodeUTF8)>
 
 Converts an IMAP envelope structure as parsed and returned from an
 IMAP fetch (envelope) call into a convenient hash structure.
 
+If $IncludeRaw is true, includes the XXX-Raw fields, otherwise
+these are left out
+
+If $DecodeUTF8 is true, then checks if the fields contain
+any quoted-printable chars, and decodes them to a perl UTF8
+string if they do
+
 See the documentation section 'FETCH RESULTS' from more information
 
 =cut
-sub _parse_envelope
-{
-  my $Env = shift;
+sub _parse_envelope {
+  my ($Env, $IncludeRaw, $DecodeUTF8) = @_;
 
   # Check envelope assumption
   scalar(@$Env) == 10
     || die "Wrong number of fields in envelope structure " . Dumper($Env);
 
+  _decode_utf8($Env->[1]) if $DecodeUTF8 && $Env->[1] =~ $NeedDecodeUTF8Regexp;
+
   # Setup hash directly from envelope structure
   my %Res = (
     'Date',        $Env->[0],
     'Subject',     $Env->[1],
-    'From',        _parse_email_address($Env->[2]),
-    'From-Raw',    $Env->[2],
-    'Sender',      _parse_email_address($Env->[3]),
-    'Sender-Raw',  $Env->[3],
-    'Reply-To',    _parse_email_address($Env->[4]),
-    'Reply-To-Raw',$Env->[4],
-    'To',          _parse_email_address($Env->[5]),
-    'To-Raw',      $Env->[5],
-    'Cc',          _parse_email_address($Env->[6]),
-    'Cc-Raw',      $Env->[6],
-    'Bcc',         _parse_email_address($Env->[7]),
-    'Bcc-Raw',     $Env->[7],
+    'From',        _parse_email_address($Env->[2], $DecodeUTF8),
+    'Sender',      _parse_email_address($Env->[3], $DecodeUTF8),
+    'Reply-To',    _parse_email_address($Env->[4], $DecodeUTF8),
+    'To',          _parse_email_address($Env->[5], $DecodeUTF8),
+    'Cc',          _parse_email_address($Env->[6], $DecodeUTF8),
+    'Bcc',         _parse_email_address($Env->[7], $DecodeUTF8),
+    ($IncludeRaw ? (
+      'From-Raw',    $Env->[2],
+      'Sender-Raw',  $Env->[3],
+      'Reply-To-Raw',$Env->[4],
+      'To-Raw',      $Env->[5],
+      'Cc-Raw',      $Env->[6],
+      'Bcc-Raw',     $Env->[7],
+    ) : ()),
     'In-Reply-To', $Env->[8],
     'Message-ID',  $Env->[9]
   );
@@ -3059,7 +3272,7 @@ sub _parse_envelope
   return \%Res;
 }
 
-=item I<_parse_bodystructure($PartNum, $BodyStructure)>
+=item I<_parse_bodystructure($BodyStructure, $IncludeRaw, $DecodeUTF8, $PartNum)>
 
 Parses a standard IMAP body structure and turns it into a perl friendly
 nested hash structure. This routine is recursive and you should not
@@ -3072,7 +3285,7 @@ See the documentation section 'FETCH RESULTS' from more information
 =cut
 sub _parse_bodystructure
 {
-  my ($Bs, $PartNum, $IsMultipart) = @_;
+  my ($Bs, $IncludeRaw, $DecodeUTF8, $PartNum, $IsMultipart) = @_;
   my %Res;
 
   # If the first item is a reference, then it's a MIME multipart structure
@@ -3085,7 +3298,7 @@ sub _parse_bodystructure
     my ($Part, @SubParts);
     for ($Part = 1; ref($Bs->[0]); $Part++) {
       my $SubPartNum = ($PartNum ? $PartNum . "." : "") . $Part;
-      my $Res = _parse_bodystructure(shift(@$Bs), $SubPartNum, 1);
+      my $Res = _parse_bodystructure(shift(@$Bs), $IncludeRaw, $DecodeUTF8, $SubPartNum, 1);
       push @SubParts, $Res;
     }
 
@@ -3123,8 +3336,8 @@ sub _parse_bodystructure
       # message/rfc822 includes the messages envelope and bodystructure
       my @MsgParts = splice(@$Bs, 5, 3);
       %Res = (
-        'Message-Envelope',       _parse_envelope(shift(@MsgParts)),
-        'Message-Bodystructure',  _parse_bodystructure(shift(@MsgParts), $PartNum),
+        'Message-Envelope',       _parse_envelope(shift(@MsgParts), $IncludeRaw, $DecodeUTF8),
+        'Message-Bodystructure',  _parse_bodystructure(shift(@MsgParts), $IncludeRaw, $DecodeUTF8, $PartNum),
         'Message-Lines',          shift(@MsgParts)
       );
     }
@@ -3175,14 +3388,16 @@ sub _parse_fetch_result {
 
     # Process known fetch results into perl form
     if ($Type eq 'envelope') {
-      $Value = _parse_envelope($Value) if $ParseMode;
+      $Value = _parse_envelope($Value, @$ParseMode{qw(EnvelopeRaw DecodeUTF8)})
+        if $ParseMode->{Envelope};
     } elsif ($Type eq 'bodystructure') {
-      $Value = _parse_bodystructure($Value) if $ParseMode;
-    } elsif ($Type =~ /^body(?:\.peek)?\[(.*)/) {
-      my $BodyArgs = $1;
+      $Value = _parse_bodystructure($Value, @$ParseMode{qw(EnvelopeRaw DecodeUTF8)})
+        if $ParseMode->{BodyStructure};
+    } elsif ($Type =~ /^(body|binary)(?:\.peek)?\[(.*)/) {
+      my $BodyArgs = $2;
 
       # Make 'body[]', 'body[]<0>', etc into plain 'body'
-      $Type = 'body';
+      $Type = $1;
 
       if ($BodyArgs =~ /^[\d.]*header/) {
         # TODO: Maybe this should go to another function, but it's tightly bound
@@ -3216,6 +3431,15 @@ sub _parse_fetch_result {
   }
 
   return \%ResultHash;
+}
+
+=item I<_decode_utf8($Value)>
+
+Decodes the passed quoted printable value to a perl UTF8 string
+
+=cut
+sub _decode_utf8 {
+  eval { $_[0] = decode('MIME-Header', $_[0]); };
 }
 
 =back
