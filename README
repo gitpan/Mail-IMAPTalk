@@ -1,4 +1,4 @@
-Mail::IMAPTalk version 1.02
+Mail::IMAPTalk version 1.03
 ==========================
 
 A perl module to access an IMAP server. See POD documentation
