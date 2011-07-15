@@ -1,5 +1,15 @@
 Revision history for Perl extension Mail::IMAPTalk.
 
+2.01  Fri Jul 15 17:00 2011
+  - Pushing to CPAN. Updating major version
+     number because of dozens of small
+     incompatible changes
+
+1.04  Mon Feb  8 13:55 2011
+  - hundreds of changes and improvements while
+     being used internally by Fastmail
+  - now making a project on github
+
 1.03  Thu Sep 29 17:58 2005
 	- improved find_message()
   - added check/subscribe/unsubscribe (thanks Shriman Gurung)

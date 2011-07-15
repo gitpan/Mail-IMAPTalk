@@ -1,8 +1,8 @@
-Mail::IMAPTalk version 1.03
-==========================
+Mail::IMAPTalk
+===========================
 
-A perl module to access an IMAP server. See POD documentation
-with the module for features.
+This module communicates with an IMAP server. Each IMAP server command
+is mapped to a method of this object.
 
 INSTALLATION
 
@@ -10,19 +10,26 @@ To install this module type the following:
 
    perl Makefile.PL
    make
+   make test
    make install
 
 DEPENDENCIES
 
-None
+Encode for automatic foldername/header decoding
 
-COPYRIGHT AND LICENCE
+AUTHOR
 
 Rob Mueller <cpan@robm.fastmail.fm>
 
+DOCUMENTATION
+
+See the POD documentation. Viewable online at CPAN
+
+http://search.cpan.org/~robm/Mail-IMAPTalk/
+
 COPYRIGHT AND LICENCE
 
-Copyright (C) 2003-2004 by FastMail IP Partners
+Copyright (C) 2003-2011 by Opera Software Australia Pty Ltd
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself.
