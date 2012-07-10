@@ -1,4 +1,3 @@
-#!/usr/bin/perl -w
 package Mail::IMAPTalk;
 
 =head1 NAME
@@ -113,13 +112,12 @@ sub import {
   goto &Exporter::import;
 }
 
-our $VERSION = '2.01';
+our $VERSION = '3.01';
 # }}}
 
 # Use modules {{{
 use Fcntl qw(:DEFAULT);
 use Socket;
-use Carp;
 use IO::Select;
 use IO::Handle;
 use IO::Socket;
@@ -130,6 +128,7 @@ use Data::Dumper;
 eval 'use Time::HiRes qw(time);';
 
 use strict;
+use warnings;
 # }}}
 
 =head1 CLASS OVERVIEW
@@ -230,7 +229,7 @@ specified in several ways:
 The value is first checked and quoted if required. Values containing
 [\000\012\015] are turned into literals, values containing
 [\000-\040\{\} \%\*\"] are quoted by surrounding with a "..." pair
-(any " themselves are turned into \").
+(any " themselves are turned into \"). undef is turned into NIL
 
 =item B<file ref>
 
@@ -246,6 +245,13 @@ The string/data in the referenced item should be sent as is, no quoting will
 occur, and the data won't be sent as quoted or as a literal regardless
 of the contents of the string/data.
 
+=item B<array ref>
+
+Emits an opening bracket, and then each item in the array separated
+by a space, and finally a closing bracket. Each item in the array
+is processed by the same methods, so can be a scalar, file ref,
+scalar ref, another array ref, etc.
+
 =item B<hash ref>
 
 The hash reference should contain only 1 item. The key is a text
@@ -255,8 +261,15 @@ string which specifies what to do with the value item of the hash.
 
 =item * 'Literal'
 
-The string/data in the second item should be sent as an IMAP literal
-regardless of the actually data in the string/data.
+The string/data in the value is sent as an IMAP literal
+regardless of the actual data in the string/data.
+
+=item * 'Quote'
+
+The string/data in the value is sent as an IMAP quoted string
+regardless of the actual data in the string/data.
+
+=back
 
 Examples:
 
@@ -269,14 +282,12 @@ Examples:
 
 =back
 
-=back
-
 =cut
 
 =head1 CONSTANTS
 
 These constants relate to the standard 4 states that an IMAP connection can
-be in. They are passed and returned from the C<state()> method. See RFC2060
+be in. They are passed and returned from the C<state()> method. See RFC 3501
 for more details about IMAP connection states.
 
 =over 4
@@ -315,15 +326,16 @@ use constant Selected => 3;
 use constant LB => "\015\012";
 use constant LBLEN => length(LB);
 
-# Regexps used to determine if header is MIME encoded
-my $RFC1522Token = qr/[^\x00-\x1f\(\)\<\>\@\,\;\:\"\/\[\]\?\.\=\ ]+/;
-my $NeedDecodeUTF8Regexp = qr/=\?$RFC1522Token\?$RFC1522Token\?[^\?]*\?=/;
+# Regexps used to determine if header is MIME encoded (we remove . from
+#  especials because of dumb ANSI_X3.4-1968 encoding)
+my $RFC2047Token = qr/[^\x00-\x1f\(\)\<\>\@\,\;\:\"\/\[\]\?\=\ ]+/;
+my $NeedDecodeUTF8Regexp = qr/=\?$RFC2047Token\?$RFC2047Token\?[^\?]*\?=/;
 
 # Known untagged responses
 my %UntaggedResponses = map { $_ => 1 } qw(exists expunge recent);
 
 # Default responses
-my %RespDefaults = ('annotation' => 'hash', 'metadata' => 'hash', 'fetch' => 'hash', 'list' => 'array', 'lsub' => 'array');
+my %RespDefaults = ('annotation' => 'hash', 'metadata' => 'hash', 'fetch' => 'hash', 'list' => 'array', 'lsub' => 'array', 'sort' => 'array', 'search' => 'array');
 
 # }}}
 
@@ -527,6 +539,7 @@ sub new {
   $Self->{Select}->add($Socket);
   $Self->{LocalFD} = fileno($Socket);
   $Self->{UseBlocking} = $Args{UseBlocking};
+  $Self->{Pedantic} = $Args{Pedantic};
 
   # Process greeting
   if ($Args{Server} || $Args{ExpectGreeting}) {
@@ -540,7 +553,7 @@ sub new {
 
   # Set base modes
   $Self->uid($Args{Uid});
-  $Self->parse_mode(Envelope => 1, BodyStructure => 1);
+  $Self->parse_mode(Envelope => 1, BodyStructure => 1, Annotation => 1);
   $Self->set_tracing(0);
   $Self->{CurrentFolder} = '';
   $Self->{CurrentFolderMode} = '';
@@ -912,12 +925,17 @@ sub literal_handle_control {
   return $Self->{LiteralControl} ? 1 : 0;
 }
 
-=item I<release_socket()>
+=item I<release_socket($Error)>
 
 Release IMAPTalk's ownership of the current socket it's using so it's not
-disconnected on DESTROY. This returns the socket, and makes sure that the 
-IMAPTalk object doesn't hold a reference to it any more. 
-This means you can't call any methods on the IMAPTalk object any more.  
+disconnected on DESTROY. This returns the socket, and makes sure that the
+IMAPTalk object doesn't hold a reference to it any more and the connection
+state is set to "Unconnected".
+
+This means you can't call any methods on the IMAPTalk object any more.
+
+If the socket is being released due to an error condition on the connection,
+then $Error is set to true.
 
 =cut
 sub release_socket {
@@ -933,6 +951,9 @@ sub release_socket {
 
   $Self->_trace("A: Release socket, fileno=" . fileno($Socket) . "\n")
     if $Self->{Trace};
+
+  # Set into no connection state
+  $Self->state(Mail::IMAPTalk::Unconnected);
 
   return $Socket;
 }
@@ -992,16 +1013,20 @@ Number of messages that are recent in the folder.
 =back
 
 Other possible responses are B<alert>, B<newname>, B<parse>,
-B<trycreate>, B<appenduid>.
+B<trycreate>, B<appenduid>, etc.
+
+The values are stored in a hash keyed on the $Response item.
+They're kept until either overwritten by a future response,
+or explicitly cleared via clear_response_code().
 
 Examples:
 
   # Select inbox and get list of permanent flags, uidnext and number
   #  of message in the folder
   $IMAP->select('inbox');
-  my $NMessages = $IMAP->get_sub_result('exists');
-  my $PermanentFlags = $IMAP->get_sub_result('permanentflags');
-  my $UidNext = $IMAP->get_sub_result('uidnext');
+  my $NMessages = $IMAP->get_response_code('exists');
+  my $PermanentFlags = $IMAP->get_response_code('permanentflags');
+  my $UidNext = $IMAP->get_response_code('uidnext');
 
 =cut
 sub get_response_code {
@@ -1009,7 +1034,7 @@ sub get_response_code {
   return $Self->{Cache}->{$Response};
 }
 
-=item I<clear_reponse_code($Response)>
+=item I<clear_response_code($Response)>
 
 Clears any response code information. Response code information
 is not normally cleared between calls.
@@ -1036,6 +1061,11 @@ See the B<FETCH RESULTS> section.
 =item I<Envelope>
 
 Parse envelopes into more Perl-friendly structure
+See the B<FETCH RESULTS> section.
+
+=item I<Annotation>
+
+Parse annotation (from RFC 5257) into more Perl-friendly structure
 See the B<FETCH RESULTS> section.
 
 =item I<EnvelopeRaw>
@@ -1105,6 +1135,31 @@ sub set_tracing {
   return $OldTrace;
 }
 
+=item I<set_unicode_folders($Unicode)>
+
+$Unicode should be 1 or 0
+
+Sets whether folder names are expected and returned
+as perl unicode strings.
+
+The default is currently 0, BUT YOU SHOULD NOT ASSUME THIS,
+because it will probably change in the future.
+
+If you want to work with perl unicode strings for
+folder names, you should call
+  $ImapTalk->set_unicode_folders(1)
+and IMAPTalk will automatically encode the unicode
+strings into IMAP-UTF7 when sending to the IMAP server,
+and will also decode IMAP-UTF7 back into perl unicode
+strings when returning results from the IMAP server.
+
+If you want to work with folder names in IMAP-UTF7 bytes,
+then call
+  $ImapTalk->set_unicode_folders(0)
+and IMAPTalk will leave folder names as bytes when
+sending to and returning results from the IMAP server.
+
+=cut
 sub set_unicode_folders {
   my $Self = shift;
   $Self->{Cache}->{UnicodeFolders} = shift;
@@ -1335,7 +1390,7 @@ sub check {
 =item I<setacl($FolderName, $User, $Rights)>
 
 Perform the IMAP 'setacl' command to set the access control list
-details of a folder/mailbox. See RFC2086 for more details on the IMAP
+details of a folder/mailbox. See RFC 4314 for more details on the IMAP
 ACL extension. $User is the user name to set the access
 rights for. $Rights is either a list of absolute rights to set, or a
 list prefixed by a - to remove those rights, or a + to add those rights.
@@ -1354,11 +1409,28 @@ list prefixed by a - to remove those rights, or a + to add those rights.
 
 =item p - post (send mail to submission address for mailbox, not enforced by IMAP4 itself)
 
+=item k - create mailboxes (CREATE new sub-mailboxes in any implementation-defined hierarchy, parent mailbox for the new mailbox name in RENAME)
+
+=item x - delete mailbox (DELETE mailbox, old mailbox name in RENAME)
+
+=item t - delete messages (set or clear \DELETED flag via STORE, set \DELETED flag during APPEND/COPY)
+
+=item e - perform EXPUNGE and expunge as a part of CLOSE
+
+=item a - administer (perform SETACL)
+
+=back
+
+Due to ambiguity in RFC 2086, some existing RFC 2086 server
+implementations use the "c" right to control the DELETE command.
+Others chose to use the "d" right to control the DELETE command. See
+the 2.1.1. Obsolete Rights in RFC 4314 for more details.
+
+=over 4
+
 =item c - create (CREATE new sub-mailboxes in any implementation-defined hierarchy)
 
 =item d - delete (STORE DELETED flag, perform EXPUNGE)
-
-=item a - administer (perform SETACL)
 
 =back
 
@@ -1397,7 +1469,7 @@ sub setacl {
 =item I<getacl($FolderName)>
 
 Perform the IMAP 'getacl' command to get the access control list
-details of a folder/mailbox. See RFC2086 for more details on the IMAP
+details of a folder/mailbox. See RFC 4314 for more details on the IMAP
 ACL extension. Returns an array of pairs. Each pair is
 a username followed by the access rights for that user. See B<setacl>
 for more information on access rights.
@@ -1462,7 +1534,7 @@ sub deleteacl {
 =item I<setquota($FolderName, $QuotaDetails)>
 
 Perform the IMAP 'setquota' command to set the usage quota
-details of a folder/mailbox. See RFC2087 for details of the IMAP
+details of a folder/mailbox. See RFC 2087 for details of the IMAP
 quota extension. $QuotaDetails is a bracketed list of limit item/value
 pairs which represent a particular type of limit and the value to set
 it to. Current limits are:
@@ -1493,7 +1565,7 @@ sub setquota {
 =item I<getquota($FolderName)>
 
 Perform the standard IMAP 'getquota' command to get the quota
-details of a folder/mailbox. See RFC2087 for details of the IMAP
+details of a folder/mailbox. See RFC 2087 for details of the IMAP
 quota extension. Returns an array reference to quota limit triplets.
 Each triplet is made of: limit item, current value, maximum value.
 
@@ -1523,7 +1595,7 @@ sub getquota {
 
 Perform the IMAP 'getquotaroot' command to get the quota
 details of a folder/mailbox and possible root quota as well.
-See RFC2087 for details of the IMAP
+See RFC 2087 for details of the IMAP
 quota extension. The result of this command is a little complex.
 Unfortunately it doesn't map really easily into any structure
 since there are several different responses. 
@@ -1592,8 +1664,7 @@ Examples:
 =cut
 sub status {
   my $Self = shift;
-  my $Msgs = ($Self->_imap_cmd("status", 0, "status", $Self->_fix_folder_name(+shift), +shift)) || return undef;
-  return _parse_list_to_hash($Msgs->[1]);
+  return $Self->_imap_cmd("status", 0, "status", $Self->_fix_folder_name(+shift), +shift);
 }
 
 =item I<multistatus($StatusList, @FolderNames)>
@@ -1603,6 +1674,9 @@ commands at once and wait for responses. This speeds up latency issues.
 
 Returns a hash ref of folder name => status results.
 
+If an error occurs, the annotation result is a scalar ref to the completion
+response string (eg 'bad', 'no', etc)
+
 =cut
 sub multistatus {
   my ($Self, $Items, @FolderList) = @_;
@@ -1610,8 +1684,10 @@ sub multistatus {
   # Send all commands at once
   my $CmdBuf = "";
   my $FirstId = $Self->{CmdId};
+  $Items = ref($Items) ? $Self->_send_data({}, "", $Items) : " " . $Items;
+
   for (@FolderList) {
-    $CmdBuf .= $Self->{CmdId}++ . " status " . ${_quote($Self->_fix_folder_name($_))} . " " . $Items . LB;
+    $CmdBuf .= $Self->{CmdId}++ . " status " . ${_quote($Self->_fix_folder_name($_))} . $Items . LB;
   }
   $Self->_imap_socket_out($CmdBuf);
 
@@ -1620,7 +1696,7 @@ sub multistatus {
   $Self->{CmdId} = $FirstId;
   for (@FolderList) {
     my ($CompletionResp, $DataResp) = $Self->_parse_response("status");
-    $Resp{$_} = ref($DataResp) ? _parse_list_to_hash($DataResp->[1]) : $CompletionResp;
+    $Resp{$_} = ref($DataResp) ? $DataResp : \$CompletionResp;
     $Self->{CmdId}++;
   }
 
@@ -1666,7 +1742,7 @@ sub getannotation {
 =item I<getmetadata($FolderName, [ \%Options ], @Entries)>
 
 Perform the IMAP 'getmetadata' command to get the metadata items
-for a mailbox.  See RFC5464 for details.
+for a mailbox.  See RFC 5464 for details.
 
 If $Options is passed, it is a hashref of options to set.
 
@@ -1744,6 +1820,9 @@ issues.
 
 Returns a hash ref of folder name => annotation results.
 
+If an error occurs, the annotation result is a scalar ref to the completion
+response string (eg 'bad', 'no', etc)
+
 =cut
 sub multigetannotation {
   my ($Self, $Entry, $Attribute, @FolderList) = @_;
@@ -1760,7 +1839,7 @@ sub multigetannotation {
   $Self->{CmdId} = $FirstId;
   for (@FolderList) {
     my ($CompletionResp, $DataResp) = $Self->_parse_response("annotation");
-    $Resp{$_} = ref($DataResp) ? $DataResp->{$_}->{$Entry}->{$Attribute} : $CompletionResp;
+    $Resp{$_} = ref($DataResp) ? $DataResp->{$_}->{$Entry}->{$Attribute} : \$CompletionResp;
     $Self->{CmdId}++;
   }
 
@@ -1779,6 +1858,82 @@ sub close {
   $Self->state(Authenticated);
 }
 
+=item I<idle(\&Callback, [ $Timeout ])>
+
+Perform an IMAP idle call. Call given callback for each IDLE event
+received.
+
+If the callback returns 0, the idle continues. If the callback returns 1,
+the idle is finished and this call returns.
+
+If no timeout is passed, will continue to idle until the callback returns
+1 or the server disconnects.
+
+If a timeout is passed (including a 0 timeout), the call will return if
+no events are received within the given time. It will return the result
+of the DONE command, and set $Self->get_response_code('timeout') to true.
+
+If the server closes the connection with a "bye" response, it will
+return undef and $@ =~ /bye/ will be true with the remainder of the bye
+line following.
+
+=cut
+sub idle {
+  my ($Self, $Callback, $Timeout) = @_;
+
+  # Create a closure to handle the idle semantics that runs
+  #  between sending the command and parsing the tagged
+  #  response (that only appears after sending DONE)
+  my $PostCommand = sub {
+    local $Self->{Timeout} = $Timeout if $Timeout;
+
+    $Self->{ReadLine} = undef;
+
+    my $Resp = $Self->_next_atom();
+    my ($Text) = @{$Self->_remaining_atoms()};
+    if (!$Resp || !$Text || $Resp ne '+' || $Text ne 'idling') {
+      die "IMAPTalk: Did not get '+ idling' response";
+    }
+
+    # Special case 0 timeout
+    if (defined $Timeout && $Timeout == 0) {
+      $Self->{Cache}->{timeout} = 1;
+      goto DoneIdle;
+    }
+
+    # If callback returns true, set $Exit to exit loop
+    my $Exit = 0;
+    my $WrapCallback = sub { $Exit = $Callback->(@_); };
+    my %ParseCB = map { $_ => $WrapCallback } qw(exists recent expunge fetch);
+
+    while (!$Exit) {
+      eval {
+        $Self->_parse_response(\%ParseCB, { IdleResponse => 1 });
+      };
+      if ($@) {
+        if ($@ =~ /timed out/) {
+          $Self->{Cache}->{timeout} = 1;
+          goto DoneIdle;
+
+        } elsif ($@ =~ /closed by host/) {
+          die "IMAPTalk: bye: " . $Self->get_response_code('bye');
+
+        } else {
+          die $@;
+        }
+      }
+    }
+
+    # Send DONE, and then fallout to parse response
+    DoneIdle:
+    $Self->_imap_socket_out("DONE" . LB);
+  };
+
+  my %ParseMode = (PostCommand => $PostCommand);
+  return $Self->_imap_cmd(\%ParseMode, 'idle', 0, '');
+}
+
+
 =back
 =cut
 
@@ -1787,10 +1942,14 @@ sub close {
 =over 4
 =cut
 
-=item I<fetch($MessageIds, $MessageItems)>
+=item I<fetch([ \%ParseMode ], $MessageIds, $MessageItems)>
 
 Perform the standard IMAP 'fetch' command to retrieve the specified message
 items from the specified message IDs.
+
+The first parameter can be an optional hash reference that overrides
+particular parse mode parameters just for this fetch. See C<parse_mode>
+for possible keys.
 
 C<$MessageIds> can be one of two forms:
 
@@ -1865,7 +2024,7 @@ C<$MessageItems> can be one of, or a bracketed list of:
 
 =back
 
-It would be a good idea to see RFC2060 for what all these means.
+It would be a good idea to see RFC 3501 for what all these means.
 
 Examples:
 
@@ -1888,12 +2047,14 @@ easier to handle as an error condition.
 sub fetch {
   my $Self = shift;
 
+  my $ParseMode = ref($_[0]) eq 'HASH' ? shift : {};
+
   # Are we fetching one uid
   my $FetchOne = !ref($_[0]) && $_[0] =~ /^\d+$/ && $_[0];
 
   # Clear any existing fetch responses and call the fetch command
   $Self->{Responses}->{fetch} = undef;
-  my $FetchRes = $Self->_imap_cmd("fetch", 1, "fetch", _fix_message_ids(+shift), @_);
+  my $FetchRes = $Self->_imap_cmd($ParseMode, "fetch", 1, "fetch", _fix_message_ids(+shift), @_);
 
   # Single message fetch with no data returns
   my $NoFetchData = ref($FetchRes) && !%$FetchRes;
@@ -1929,7 +2090,7 @@ Perform standard IMAP append command to append a new message into a folder.
 
 The $MessageData to append can either be a Perl scalar containing the data,
 or a file handle to read the data from. In each case, the data must be in
-proper RFC822 format with \r\n line terminators.
+proper RFC 822 format with \r\n line terminators.
 
 Any optional fields not needed should be removed, not left blank.
 
@@ -2022,8 +2183,8 @@ sub uidexpunge {
 Perform extension IMAP sort command. The result is an array reference to a list
 of message IDs (or UIDs if in Uid mode) in sorted order.
 
-It would probably be a good idea to look at the sort extension details at
-somewhere like : http://www.imap.org/papers/docs/sort-ext.html.
+It would probably be a good idea to look at the sort RFC 5256 details at
+somewhere like : http://www.ietf.org/rfc/rfc5256.txt
 
 Examples:
 
@@ -2277,22 +2438,23 @@ sub find_message {
 
   my %KnownTextParts = map { $_ => 1 } qw(plain html text enriched);
 
-  my @PartList = ([ undef, $_[0], 0, '' ]);
+  my @PartList = ([ undef, $_[0], 0, '', \(my $Tmp = '') ]);
 
   # Repeat until we find something
   while (my $Part = shift @PartList) {
-    my ($Parent, $BS, $Pos, $InMultiList) = @$Part;
+    my ($Parent, $BS, $Pos, $InMultiList, $MultiTypeRef) = @$Part;
 
-    my $AltType = '';
     my $InsideAlt = $InMultiList =~ /\balternative\b/ ? 1 : 0;
 
     # Pull out common MIME fields we'll look at
     my ($MTT, $MT, $ST, $SP) = @$BS{qw(MIME-TxtType MIME-Type MIME-Subtype MIME-Subparts)};
 
-    my $CD = $BS->{'Content-Disposition'} || {};
+    # Note: $DT can be "", which really is default "inline", so compare
+    #  with "$DT ne 'attachment'", rather than "$DT eq 'inline'"
+    my ($DT, $CD) = @$BS{qw(Disposition-Type Content-Disposition)};
 
     # Yay, found text component that ins't an attachment or has a filename
-    if ($MT eq 'text' && (!exists $CD->{attachment} && !$CD->{inline}->{filename})) {
+    if ($MT eq 'text' && ($DT ne 'attachment' && !$CD->{filename} && !$CD->{'filename*'})) {
 
       # See if it's a sub-type we understand/want
       if ($KnownTextParts{$ST}) {
@@ -2331,11 +2493,11 @@ sub find_message {
         #  or best part type if we are
         if ($UT eq 'text' || !$InsideAlt) {
           push @{$MsgComponents{'textlist'}}, $BS;
-          $AltType = $UT if $InsideAlt;
+          $$MultiTypeRef ||= $UT;
         }
         if ($UT eq 'html' || !$InsideAlt) {
           push @{$MsgComponents{'htmllist'}}, $BS;
-          $AltType = $UT if $InsideAlt;
+          $$MultiTypeRef ||= $UT;
         }
 
         # Ok got a known part, move to next
@@ -2346,11 +2508,15 @@ sub find_message {
     } elsif ($MT eq 'image') {
 
       # Only add inline images
-      if (!exists $CD->{attachment}) {
+      if ($DT ne 'attachment') {
         # In alternative parts, we store which list part
         #  we're in in $InsideAlt
-        my $ItemList = $MsgComponents{$AltType . 'list'};
-        push @$ItemList, $BS if $ItemList;
+        my $ItemList = $MsgComponents{$$MultiTypeRef . 'list'};
+        if ($ItemList) {
+          push @$ItemList, $BS;
+          # Mark this list as having an image
+          $MsgComponents{$$MultiTypeRef . 'listimage'} = 1;
+        }
       }
       # And always add the image as an attachment below
 
@@ -2359,17 +2525,18 @@ sub find_message {
 
       # Look at all sub-parts
       my $Pos = 0;
+      my $MultiType = '';
+      my $SubMultiList = join ",", ($InMultiList or ()), $ST;
+      my @SubParts = map { [ $BS, $_, $Pos++, $SubMultiList, \$MultiType ] } @$SP;
 
       # If it's a signed/alternative/related sub-part, look in it FIRST
-      if ($ST eq 'signed' || $ST eq 'alternative' || $ST eq 'related' || $CD->{inline}) {
-        my $SubMultiList = join ",", ($InMultiList or ()), $ST;
-        unshift @PartList, map { [ $BS, $_, $Pos++, $SubMultiList ] } @$SP;
+      if ($ST eq 'signed' || $ST eq 'alternative' || $ST eq 'related' || $DT ne 'attachment') {
+        unshift @PartList, @SubParts;
 
       # Otherwise look in it after we've looked at all the other components
       #  at the current level
       } else {
-        my $SubMultiList = join ",", ($InMultiList or ()), $ST;
-        push @PartList, map { [ $BS, $_, $Pos++, $SubMultiList ] } @$SP;
+        push @PartList, @SubParts;
       }
 
       # No attachment, move on to next part
@@ -2384,7 +2551,7 @@ sub find_message {
         msg => 1
       ) : (
         text => 1,
-        html => $MT eq 'images' && $InMultiList =~ /\brelated\b/ ? 0 : 1,
+        html => $MT eq 'image' && $InMultiList =~ /\brelated\b/ ? 0 : 1,
       )
     };
   }
@@ -2405,7 +2572,7 @@ sub generate_cid {
 
   my $Digester = Digest->new( 'MD5' );
   $Digester->add( $_[0] );
-  $Digester->add( $_[1]->{'IMAP-Partnum'} );
+  $Digester->add( $_[1]->{'IMAP-Partnum'} || '' );
   $Digester->add( $_[1]->{'Size'} || 'none' );
   $Digester->add( $_[1]->{'MIME-TxtType'} || 'none' );
   my $Cid = 'Generated-' . $Digester->b64digest() . '@messagingengine.com';
@@ -2671,10 +2838,8 @@ However, if you set the C<parse_mode(BodyStructure => 1)>, then the result would
         'Size' => '3569',
         'Lines' => '94',
         'Content-MD5' => undef,
-        'Content-Disposition' => [
-          'INLINE',
-          undef
-        ],
+        'Disposition-Type' => 'inline',
+        'Content-Disposition' => {},
         'Content-Language' => undef,
         'Remainder' => [],
         'IMAP-Partnum' => ''
@@ -2712,6 +2877,8 @@ In general, the following items are defined for all body structures:
 =item * MIME-Subtype
 
 =item * Content-Type
+
+=item * Disposition-Type
 
 =item * Content-Disposition
 
@@ -2818,8 +2985,47 @@ if you change C<parse_mode(Envelope => 1)>, you get a neat structure as follows:
   };
 
 All the fields here are from straight from the email headers.
-See RFC822 for more details.
+See RFC 822 for more details.
 
+=head2 Annotation
+
+If the server supports RFC 5257 (ANNOTATE Extension), then you can
+fetch per-message annotations.
+
+Annotation responses would normally be returned as a a nested set of
+arrays. However it's much easier to access the results as a nested set
+of hashes, so the results are so converted if the Annotation parse
+mode is enabled, which is on by default.
+
+Part of an example from the RFC
+
+   S: * 12 FETCH (UID 1123 ANNOTATION
+      (/comment (value.priv "My comment"
+         size.priv "10")
+      /altsubject (value.priv "Rhinoceroses!"
+         size.priv "13")
+
+So the fetch command:
+
+  my $Res = $IMAP->fetch(1123, 'annotation', [ '/*', [ 'value.priv', 'size.priv' ] ]);
+
+Would have the result:
+
+  $Res = {
+    '1123' => {
+      'annotation' => {
+        '/comment' => {
+          'value.priv' => 'My comment',
+          'size.priv => 10
+        },
+        '/altsubject' => {
+          'value.priv' => '"Rhinoceroses',
+          'size.priv => 13
+        }
+      }
+    }
+  }
+         
 =cut
 
 =head1 INTERNAL METHODS
@@ -2869,7 +3075,9 @@ Any extra arguments to pass to command.
 
 =cut
 sub _imap_cmd {
-  my ($Self, $Cmd, $IsUidCmd, $RespItems, @Args) = @_;
+  my $Self = shift;
+  my $ParseMode = ref($_[0]) eq 'HASH' ? shift : {};
+  my ($Cmd, $IsUidCmd, $RespItems) = (shift, shift, shift);
 
   # Remember the last command and reset last error
   $Self->{LastCmd} = $Cmd;
@@ -2882,21 +3090,28 @@ sub _imap_cmd {
   my ($CompletionResp, $DataResp);
   eval {
     # Send the command and parse the response
-    $Self->_send_cmd($Cmd, @Args);
+    $Self->_send_cmd($Cmd, @_);
+    $ParseMode->{PostCommand}->() if $ParseMode->{PostCommand};
     # Items returned are the complete response (eg ok/bad/no) and
     #  the any parsed data to return from the command
-    ($CompletionResp, $DataResp) = $Self->_parse_response($RespItems);
-    $Self->{CmdId}++;
+    ($CompletionResp, $DataResp) = $Self->_parse_response($RespItems, $ParseMode);
   };
+  $Self->{CmdId}++;
   $Self->{LastRespCode} = $CompletionResp;
 
   # Return undef if any error occurred (either through 'die' or non-'OK' IMAP response)
   if ($@) {
     warn($@) if $@ !~ /NO Over quota/;
-    if ($@ =~ /IMAPTalk/) {
+
+    # One of our errors? Capture, set $@ and return undef
+    if ($@ =~ /IMAPTalk/ && !$Self->{Pedantic}) {
       $Self->{LastError} = $@ = "IMAP Command : '$Cmd' failed. Reason was : $@";
       return undef;
     }
+
+    # If something else threw the error, rethrow, but release socket first since
+    #  connection is in an indeterminate state
+    $Self->release_socket(1);
     die $@;
   };
 
@@ -2933,7 +3148,7 @@ sub _send_cmd {
 
   # Output remainder of line buffer (if empty, we still want
   #  to send the \015\012 chars)
-  $Self->_imap_socket_out($LineBuffer . LB);
+  $Self->_imap_socket_out($LineBuffer . LB) if defined $LineBuffer;
 
   return 1;
 }
@@ -3057,9 +3272,11 @@ sub _send_data {
           $Self->_copy_handle_to_handle($Arg, $Self->{Socket}, $LiteralSize);
         }
 
-      # If no "+ go ahead" response, set error state
+      # If no "+ go ahead" response, stick back in read buffer and fall out
+      #  to parse what the response was
       } else {
-        die 'IMAPTalk: Did not get "+ ...go ahead..." response from IMAP server. Got - ' . $GoAhead;
+        substr($Self->{ReadBuf}, 0, 0, $GoAhead . LB);
+        return undef;
       }
 
     }
@@ -3070,7 +3287,7 @@ sub _send_data {
   return $LineBuffer;
 }
 
-=item I<_parse_response($Self, $RespItems)>
+=item I<_parse_response($Self, $RespItems, [ \%ParseMode ])>
 
 Helper method called by B<_imap_cmd> after sending the command. This
 methods retrieves data from the IMAP socket and parses it into Perl
@@ -3094,12 +3311,15 @@ from the function
 
 =cut
 sub _parse_response {
-  my ($Self, $RespItems) = @_;
+  my ($Self, $RespItems, $ParseMode) = @_;
 
   # Loop until we get the tagged response for the sent command
   my $Result;
   my $Tag = '';
-  my (%DataResp, $CompletionResp, $Res1, $Callback);
+  my (%DataResp, $CompletionResp, $Res1, $Callback, %UnfixCache);
+
+  # Build final parse mode. Note overrides come second to replace defaults
+  my %ParseMode = (%{$Self->{ParseMode} || {}}, %{$ParseMode || {}});
 
   # Some commands might have no results (eg list, fetch, etc), but we
   #  want to distinguish no results vs IMAP NO result, so setup a default
@@ -3110,8 +3330,15 @@ sub _parse_response {
     $DataResp{$RespItems} = [] if $RespDefault eq 'array';
   }
 
+  # Response item we'll return
+  my $RespItem = !ref($RespItems) ? $RespItems : $RespItems->{responseitem} || '';
+
   # Store completion response and data responses
   while ($Tag ne $Self->{CmdId}) {
+    if ($Tag && $Tag ne '*' && $Self->{Pedantic}) {
+      die "IMAPTalk: Unexpected tag '$Tag'";
+    }
+
     # Force starting new line read
     $Self->{ReadLine} = undef;
 
@@ -3130,7 +3357,7 @@ sub _parse_response {
       # Parse fetch response into perl structure
       my $Fetch;
       if ($Res2 eq 'fetch') {
-        $Fetch = _parse_fetch_result($Self->_next_atom(), $Self->{ParseMode});
+        $Fetch = _parse_fetch_result($Self->_next_atom(), \%ParseMode);
       }
 
       if (ref($RespItems) && ($Callback = $RespItems->{$Res2})) {
@@ -3178,16 +3405,29 @@ sub _parse_response {
         # Avoid data copy if possible, could be large UID list
         $DataResp{$Res1} = $IdList;
       }
+    } elsif ($Res1 eq 'status') {
+      my ($Name, $StatusRes) = @{$Self->_remaining_atoms()};
+      $StatusRes = _parse_list_to_hash($StatusRes);
 
-    } elsif ($Res1 eq 'flags' || $Res1 eq 'status' ||
-             $Res1 eq 'thread' || $Res1 eq 'namespace') {
+      # If we explicit requested parsing the status response, we just want
+      #  the data (we know the folder). Otherwise this is an unsolicited
+      #  status response (eg list extended return status), and we want
+      #  to store the folder so we can get it via get_response_code.
+      if ($RespItem eq 'status') {
+        $DataResp{$Res1} = $StatusRes;
+      } else {
+        $Name = ($UnfixCache{$Name} ||= $Self->_unfix_folder_name($Name));
+        $DataResp{$Res1}->{$Name} = $StatusRes;
+      }
+
+    } elsif ($Res1 eq 'flags' || $Res1 eq 'thread' || $Res1 eq 'namespace') {
       $DataResp{$Res1} = $Self->_remaining_atoms();
 
     } elsif ($Res1 eq 'list' || $Res1 eq 'lsub') {
       my ($Attr, $Sep, $Name) = @{$Self->_remaining_atoms()};
       $Self->_set_separator($Sep);
       # Remove root text from folder name
-      $Name = $Self->_unfix_folder_name($Name);
+      $Name = ($UnfixCache{$Name} ||= $Self->_unfix_folder_name($Name));
       push @{$DataResp{$Res1}}, [ $Attr, $Sep, $Name ];
 
     } elsif ($Res1 eq 'permanentflags' || $Res1 eq 'uidvalidity' ||
@@ -3195,9 +3435,13 @@ sub _parse_response {
       $DataResp{$Res1} = $Self->_next_atom();
       $Self->_remaining_line();
 
-    } elsif ($Res1 eq 'alert' || $Res1 eq 'newname' ||
+    } elsif ($Res1 eq 'newname' ||
       $Res1 eq 'parse' || $Res1 eq 'trycreate') {
       $DataResp{$Res1} = $Self->_remaining_line();
+
+    } elsif ($Res1 eq 'alert') {
+      # No argument to alert, it's the remainder of the line after the ]
+      $DataResp{$Res1} = delete $DataResp{remainder};
 
     } elsif ($Res1 eq 'capability' || $Res1 eq 'enabled') {
       $DataResp{$Res1} = { map { lc($_) => 1 } @{$Self->_remaining_atoms() || []} };
@@ -3239,15 +3483,16 @@ sub _parse_response {
 
     } elsif ($Res1 eq 'annotation') {
       my ($Name, $Entry, $Attributes) = @{$Self->_remaining_atoms()};
-      $Name = $Self->_unfix_folder_name($Name);
+      $Name = ($UnfixCache{$Name} ||= $Self->_unfix_folder_name($Name));
       $DataResp{annotation}->{$Name}->{$Entry} = { @{$Attributes || []} };
 
     } elsif ($Res1 eq 'metadata') {
       my ($Name, $Bits) = @{$Self->_remaining_atoms()};
-      $Name = $Self->_unfix_folder_name($Name);
+      $Name = ($UnfixCache{$Name} ||= $Self->_unfix_folder_name($Name));
       $DataResp{metadata}->{$Name}->{$Bits->[0]} = $Bits->[1];
 
     } elsif (($Res1 eq 'bye') && ($Self->{LastCmd} ne 'logout')) {
+      $Self->{Cache}->{bye} = $Self->_remaining_line();
       die "IMAPTalk: Connection was unexpectedly closed by host";
 
     } elsif ($Res1 eq 'no' || $Res1 eq 'bad') {
@@ -3262,11 +3507,11 @@ sub _parse_response {
       die 'IMAPTalk: Unexpected data remaining on response line "' . $Self->{ReadLine} . '"';
     }
 
+    last if $ParseMode{IdleResponse};
   }
 
   # Return the requested item from %DataResp, and put
   #  the rest in $Self->{Cache}
-  my $RespItem = !ref($RespItems) ? $RespItems : $RespItems->{responseitem} || '';
   $Result ||= delete $DataResp{$RespItem};
   $Result ||= $Res1;
   $Self->{Cache}->{$_} = $DataResp{$_} for keys %DataResp;
@@ -3387,7 +3632,8 @@ sub _next_atom {
   do {
 
     # Single item? (and any trailing space)
-    if ($Line =~ m/\G([^()\"{}\s]+)(?: |\z|(?=\)))/gc) {
+    # (make it trailing spaces, due to buggy XIMAPPROXY)
+    if ($Line =~ m/\G([^()\"{\s]+)(?: +|\z|(?=\)))/gc) {
       # Add to current atom. If there's a stack, must be within a bracket
       if (scalar @AtomStack) {
         push @$AtomRef, $1 eq 'NIL' ? undef : $1;
@@ -3733,14 +3979,14 @@ sub _copy_handle_to_handle {
   my $Val;
   while (my $NRead = $InHandle->read($Val, 8192)) {
     if (!defined $NRead) {
-      die 'IMAPTalk: Error reading data from io handle.' . $@;
+      die 'IMAPTalk: Error reading data from io handle.' . $!;
     }
 
     my $NWritten = 0;
     while ($NWritten != $NRead) {
       my $NWrite = $OutHandle->syswrite($Val, $NRead-$NWritten, $NWritten);
       if (!defined $NWrite) {
-        die 'IMAPTalk: Error writing data to io handle.' . $@;
+        die 'IMAPTalk: Error writing data to io handle.' . $!;
       }
       $NWritten += $NWrite;
     }
@@ -3855,12 +4101,6 @@ sub _fix_folder_name {
     $FolderName = Encode::encode( 'IMAP-UTF-7', $FolderName );
   }
 
-  if (! $Self->unicode_folders() ) {
-    warn("Please report to rjlov");
-    Carp::cluck("Warning only: IMAPTalk not using unicode_folders");
-    warn("Please report to rjlov");
-  }
-
   return $FolderName if $WildCard && $FolderName =~ /[\*\%]/;
 
   # XXX - make more general/configurable
@@ -3893,16 +4133,10 @@ sub _unfix_folder_name {
   my $UFM = $Self->{UnrootFolderMatch};
   $FolderName =~ s/^$UFM// if $UFM;
 
-  if ( $Self->unicode_folders()
-    && ( $FolderName =~ m{&} ) )
+  my $UnicodeFolders = $Self->unicode_folders();
+  if ( $UnicodeFolders && ( $FolderName =~ m{&} ) )
   {
     $FolderName = Encode::decode( 'IMAP-UTF-7', $FolderName );
-  } 
-  
-  if (! $Self->unicode_folders() ) {
-    warn("Please report to rjlov");
-    Carp::cluck("Warning only: IMAPTalk not using unicode_folders");
-    warn("Please report to rjlov");
   }
 
   return $FolderName;
@@ -3976,7 +4210,7 @@ sub _fix_message_ids {
 =item I<_parse_email_address($EmailAddressList)>
 
 Converts a list of IMAP email address structures as parsed and returned
-from an IMAP fetch (envelope) call into a single RFC822 email string
+from an IMAP fetch (envelope) call into a single RFC 822 email string
 (e.g. "Person 1 Name" <ename@ecorp.com>, "Person 2 Name" <...>, etc) to
 finally return to the user.
 
@@ -4005,10 +4239,12 @@ sub _parse_email_address {
 
     # Build 'ename@ecorp.com' part
     my $EmailStr = (defined $Adr->[2] ? $Adr->[2] : '')
-                 . '@' 
+                 . '@'
                  . (defined $Adr->[3] ? $Adr->[3] : '');
     # If the email address has a name, add it at the start and put <> around address
     if (defined $Adr->[0] and $Adr->[0] ne '') {
+      # CRLF's are folding that's leaked into data where it shouldn't, strip them
+      $Adr->[0] =~ s/\r?\n//g;
       _decode_utf8($Adr->[0]) if $DecodeUTF8 && $Adr->[0] =~ $NeedDecodeUTF8Regexp;
       # Strip any existing \"'s
       $Adr->[0] =~ s/\"//g;
@@ -4113,7 +4349,8 @@ sub _parse_bodystructure {
       'MIME-Type',           'multipart',
       'MIME-Subtype',        lc(shift(@$Bs)),
       'Content-Type',        _parse_list_to_hash(shift(@$Bs)),
-      'Content-Disposition', _parse_list_to_hash(shift(@$Bs), 1),
+      'Disposition-Type',    lc(shift(@{$Bs->[0]})),
+      'Content-Disposition', _parse_list_to_hash(@{shift(@$Bs)}),
       'Content-Language',    shift(@$Bs),
       'Content-Location',    shift(@$Bs),
       # Shouldn't be anything after this. Add as remainder if there is
@@ -4159,7 +4396,8 @@ sub _parse_bodystructure {
       'Content-Transfer-Encoding',  shift(@$Bs),
       'Size',                       shift(@$Bs),
       'Content-MD5',                shift(@$Bs),
-      'Content-Disposition',        _parse_list_to_hash(shift(@$Bs), 1),
+      'Disposition-Type',           lc(shift(@{$Bs->[0]})),
+      'Content-Disposition',        _parse_list_to_hash(@{shift(@$Bs)}),
       'Content-Language',           shift(@$Bs),
       'Content-Location',           shift(@$Bs),
       # Shouldn't be anything after this. Add as remainder if there is
@@ -4173,6 +4411,24 @@ sub _parse_bodystructure {
   $Res{'MIME-TxtType'} = $Res{'MIME-Type'} . '/' . $Res{'MIME-Subtype'};
 
   return \%Res;
+}
+
+=item I<_parse_fetch_annotation($AnnotateItem)>
+
+Takes the result from a single IMAP annotation item
+into a Perl friendly structure. 
+
+See the documentation section 'FETCH RESULTS' from more information.
+
+=cut
+sub _parse_fetch_annotation {
+  my ($Value) = @_;
+
+  return $Value unless ref($Value) eq 'ARRAY';
+  my %Result = @$Value;
+  map { $_ = { @$_ } if ref($_) eq 'ARRAY' } values %Result;
+
+  return \%Result;
 }
 
 =item I<_parse_fetch_result($FetchResult)>
@@ -4200,15 +4456,20 @@ sub _parse_fetch_result {
     } elsif ($Type eq 'bodystructure') {
       $Value = _parse_bodystructure($Value, @$ParseMode{qw(EnvelopeRaw DecodeUTF8)})
         if $ParseMode->{BodyStructure};
-    } elsif ($Type =~ /^(body|binary)(?:\.peek)?\[(.*)/) {
+    } elsif ($Type =~ /^(body|binary)(?:\.peek)?\[([^\]]*)/) {
       my $BodyArgs = $2;
 
-      # Make 'body[]', 'body[]<0>', etc into plain 'body'
+      # Make 'body[]', 'body[]<0>', etc into plain 'body' (unless FullBody mode)
       $Type = $1;
 
       if ($BodyArgs =~ /^[\d.]*header/) {
         _parse_header_result($ResultHash{headers} ||= {}, $Value, $FetchResult);
+      } else {
+        $Type .= "[${BodyArgs}]" if $ParseMode->{FullBody}
       }
+    } elsif ($Type eq 'annotation') {
+      $Value = _parse_fetch_annotation($Value)
+        if $ParseMode->{Annotation};
     }
 
     # Store result (either modified or original) into hash
@@ -4254,6 +4515,10 @@ Decodes the passed quoted printable value to a Perl UTF8 string.
 
 =cut
 sub _decode_utf8 {
+  # Fix dumb, dumb ANSI_X3.4-1968 encoding. It's not actually a valid
+  #  charset according to RFC2047, "." is an especial, so Encode ignores it
+  # See http://en.wikipedia.org/wiki/ASCII for other aliases
+  $_[0] =~ s/=\?ANSI_X3\.4-(?:1968|1986)\?/=?US-ASCII?/gi;
   eval { $_[0] = decode('MIME-Header', $_[0]); };
 }
 
@@ -4329,7 +4594,7 @@ sub DESTROY {
 
 =head1 SEE ALSO
 
-I<Net::IMAP>, I<Mail::IMAPClient>, I<IMAP::Admin>, RFC2060
+I<Net::IMAP>, I<Mail::IMAPClient>, I<IMAP::Admin>, RFC 3501
 
 Latest news/details can also be found at:
 
